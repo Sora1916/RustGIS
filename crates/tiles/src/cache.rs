@@ -597,6 +597,28 @@ fn forget_dropped(c: &mut Cache, dropped: &[Waiting<Job>]) {
     IN_FLIGHT.fetch_sub(dropped.len(), Ordering::Release);
 }
 
+/// Releases tiles that were selected to start but never launched (e.g. when launch is unwound
+/// by a panic). Forgets their pending cache entries, frees their host reservations, and balances
+/// in_flight() accounting.
+fn release_unstarted(unstarted: Vec<Waiting<Job>>) {
+    if unstarted.is_empty() {
+        return;
+    }
+    let count = unstarted.len();
+    {
+        let mut q = queue().lock().unwrap_or_else(|e| e.into_inner());
+        let mut c = lock();
+        for w in &unstarted {
+            if matches!(c.slots.get(&w.url), Some(Slot { entry: Entry::Pending, .. })) {
+                c.slots.remove(&w.url);
+            }
+            q.cancel(&w.host);
+        }
+    }
+    IN_FLIGHT.fetch_sub(count, Ordering::Release);
+    notify();
+}
+
 thread_local! {
     static TO_START: RefCell<Vec<Waiting<Job>>> = const { RefCell::new(Vec::new()) };
     static STARTING: Cell<bool> = const { Cell::new(false) };
@@ -615,11 +637,15 @@ fn launch(jobs: Vec<Waiting<Job>>) {
         if starting.replace(true) {
             return;
         }
-        // Lowered however this ends: a fetcher that panics must not stop every later fetch.
+        // Lowered however this ends: a fetcher that panics must not stop every later fetch,
+        // and any selected but unstarted jobs must be released so pending states, host slots,
+        // and in_flight() stay consistent.
         struct Lower<'a>(&'a Cell<bool>);
         impl Drop for Lower<'_> {
             fn drop(&mut self) {
                 self.0.set(false);
+                let unstarted = TO_START.with(|q| std::mem::take(&mut *q.borrow_mut()));
+                release_unstarted(unstarted);
             }
         }
         let _lower = Lower(starting);
@@ -3348,14 +3374,75 @@ mod tests {
         });
         started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
 
-        let g = generation();
         assert!(matches!(get("test://fast/1.json", Want::Json), State::Pending));
-        let generation_moved_immediately = generation() > g;
+        let fast_ready_immediately = matches!(get("test://fast/1.json", Want::Json), State::Ready(_));
 
         release_tx.send(()).unwrap();
         thread_a.join().unwrap();
 
-        assert!(generation_moved_immediately, "fast fetch on thread B was parked behind thread A's in-flight launch");
+        assert!(fast_ready_immediately, "fast fetch on thread B was parked behind thread A's in-flight launch");
         assert!(matches!(get("test://fast/1.json", Want::Json), State::Ready(_)));
+    }
+
+    #[test]
+    fn fetcher_panic_unwinds_launch_and_releases_queued_replacement() {
+        let _turn = crate::cache::turn();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (panic_started_tx, panic_started_rx) = std::sync::mpsc::channel();
+        let (panic_trigger_tx, panic_trigger_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let panic_trigger_rx = Arc::new(Mutex::new(panic_trigger_rx));
+
+        let cap = crate::schedule::PER_HOST;
+        let rx = release_rx.clone();
+        let p_rx = panic_trigger_rx.clone();
+        set_fetcher(move |url, done| {
+            if url.contains("/slow_") {
+                started_tx.send(()).unwrap();
+                rx.lock().unwrap().recv_timeout(Duration::from_secs(5)).unwrap();
+                done(Ok(b"{\"slow\": true}".to_vec()));
+            } else if url.contains("/panic.json") {
+                panic_started_tx.send(()).unwrap();
+                p_rx.lock().unwrap().recv_timeout(Duration::from_secs(5)).unwrap();
+                panic!("simulated fetcher panic during launch");
+            } else {
+                done(Ok(b"{\"replacement\": true}".to_vec()));
+            }
+        });
+
+        let mut threads = Vec::new();
+        for i in 0..(cap - 1) {
+            threads.push(std::thread::spawn(move || {
+                let _ = get(&format!("test://samehost/slow_{i}.json"), Want::Json);
+            }));
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+
+        let panic_thread = std::thread::spawn(|| {
+            let _ = get("test://samehost/panic.json", Want::Json);
+        });
+        panic_started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let waiting_url = "test://samehost/waiting.json";
+        assert!(matches!(get(waiting_url, Want::Json), State::Pending));
+
+        panic_trigger_tx.send(()).unwrap();
+        let _ = panic_thread.join();
+
+        assert!(lock().slots.get(waiting_url).is_none());
+        assert_eq!(in_flight(), cap - 1);
+
+        assert!(matches!(get(waiting_url, Want::Json), State::Pending));
+        assert!(matches!(get(waiting_url, Want::Json), State::Ready(_)));
+
+        for _ in 0..(cap - 1) {
+            release_tx.send(()).unwrap();
+        }
+        for t in threads {
+            t.join().unwrap();
+        }
+
+        assert_eq!(in_flight(), 0);
     }
 }
