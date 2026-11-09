@@ -856,9 +856,7 @@ fn release_unstarted(unstarted: Vec<Waiting<Job>>) {
         let mut q = queue().lock().unwrap_or_else(|e| e.into_inner());
         let mut c = lock();
         for w in &unstarted {
-            if matches!(c.slots.get(&w.url), Some(Slot { entry: Entry::Pending, .. })) {
-                c.slots.remove(&w.url);
-            }
+            forget_pending(&mut c, &w.url);
             q.cancel(&w.host);
         }
     }
@@ -5312,6 +5310,7 @@ mod tests {
     #[test]
     fn fetcher_panic_unwinds_launch_and_releases_queued_replacement() {
         let _turn = crate::cache::turn();
+        wait(Duration::from_secs(5));
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (panic_started_tx, panic_started_rx) = std::sync::mpsc::channel();
         let (panic_trigger_tx, panic_trigger_rx) = std::sync::mpsc::channel();
@@ -5369,5 +5368,46 @@ mod tests {
         }
 
         assert_eq!(in_flight(), 0);
+    }
+
+    #[test]
+    fn release_unstarted_preserves_retained_outcome_and_bytes() {
+        let _turn = crate::cache::turn();
+        wait(Duration::from_secs(5));
+        clear();
+
+        let url = "test://retained/tile.json";
+        let payload = Arc::new(Payload::Json("{\"retained\": true}".into()));
+        let initial_bytes = payload_bytes(&payload);
+        {
+            let mut c = lock();
+            keep_for(&mut c, url, Entry::Ready(payload.clone(), initial_bytes, None), crate::address::Reach::Local);
+            assert_eq!(c.bytes, initial_bytes);
+        }
+
+        {
+            let mut c = lock();
+            keep_for(&mut c, url, Entry::Pending, crate::address::Reach::Public);
+            assert_eq!(c.bytes, initial_bytes);
+            let slot = c.slots.get(url).unwrap();
+            assert!(matches!(slot.entry, Entry::Pending));
+            assert!(slot.other.is_some());
+        }
+
+        let waiting = Waiting {
+            url: url.to_string(),
+            host: "retained".to_string(),
+            job: (Want::Json, Capture::current(), &[] as &'static [u16], 0u64, None, crate::address::Reach::Public),
+        };
+        release_unstarted(vec![waiting]);
+
+        {
+            let c = lock();
+            let slot = c.slots.get(url).expect("slot should be preserved");
+            assert!(matches!(slot.entry, Entry::Ready(..)));
+            assert_eq!(slot.ceiling, crate::address::Reach::Local);
+            assert!(slot.other.is_none());
+            assert_eq!(c.bytes, initial_bytes);
+        }
     }
 }
