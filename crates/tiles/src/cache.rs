@@ -5394,12 +5394,23 @@ mod tests {
             assert!(slot.other.is_some());
         }
 
-        let waiting = Waiting {
-            url: url.to_string(),
-            host: "retained".to_string(),
-            job: (Want::Json, Capture::current(), &[] as &'static [u16], 0u64, None, crate::address::Reach::Public),
+        IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
+        let mut swept = Vec::new();
+        let waiting = {
+            let mut q = queue().lock().unwrap_or_else(|e| e.into_inner());
+            let mut c = lock();
+            let latest = c.latest.unwrap_or_else(Instant::now);
+            let job = (Want::Json, Capture::current(), &[] as &'static [u16], 0u64, None, crate::address::Reach::Public);
+            let w = q
+                .push(url.to_string(), job, |u| c.slots.get(u).map(|s| s.asked), latest, &mut swept)
+                .expect("job should be scheduled immediately");
+            forget_dropped(&mut c, &swept);
+            w
         };
+        assert_eq!(in_flight(), 1);
+
         release_unstarted(vec![waiting]);
+        assert_eq!(in_flight(), 0);
 
         {
             let c = lock();
